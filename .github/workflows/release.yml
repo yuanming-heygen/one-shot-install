@@ -1,0 +1,57 @@
+name: Auto-pack and Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pack standalone installer
+        run: bash pack.sh > install-standalone.sh
+
+      - name: Extract version
+        id: version
+        run: |
+          ver=$(grep -m1 '^INSTALL_VERSION=' install.sh | sed 's/INSTALL_VERSION="//;s/"//')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            install-standalone.sh \
+            --title "v${{ steps.version.outputs.version }}" \
+            --notes "$(cat <<'EOF'
+          ## Quick install
+
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/install-standalone.sh | bash
+          ```
+
+          Dry-run:
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/install-standalone.sh | bash -s -- --check
+          ```
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
