@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+# Auto Installation Script
+#
+# Usage: ./install.sh [--check] [--force]
+#   --check   Dry-run: show what would be done without making changes
+#   --force   Re-run even if the current version is already installed
+#
+# Config files (p10k.zsh, tmux.config.local) are loaded from the same
+# directory as this script by default. Override with env vars:
+#   P10K_CONFIG_PATH / P10K_CONFIG_URL
+#   TMUX_LOCAL_CONFIG_PATH / TMUX_LOCAL_CONFIG_URL
+#
+# File permissions: this script should be chmod 0755 (rwxr-xr-x)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+INSTALL_VERSION="1.0.0"
+INSTALL_STATE_DIR="${HOME}/.config/shell"
+INSTALL_STATE_FILE="${INSTALL_STATE_DIR}/install-version"
+
+# Default config paths: use repo-local files if env vars not set
+P10K_CONFIG_PATH="${P10K_CONFIG_PATH:-${SCRIPT_DIR}/p10k.zsh}"
+TMUX_LOCAL_CONFIG_PATH="${TMUX_LOCAL_CONFIG_PATH:-${SCRIPT_DIR}/tmux.config.local}"
+
+# Pinned tool versions
+NVM_VERSION="v0.40.4"
+P10K_TAG="v1.20.0"
+ZSH_AUTOSUGG_TAG="v0.7.1"
+ZSH_SYNTAX_HL_TAG="0.8.0"
+
+# Flags (set by parse_args)
+CHECK_MODE=false
+FORCE_MODE=false
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --check)  CHECK_MODE=true ;;
+      --force)  FORCE_MODE=true ;;
+      *)        warn "Unknown argument: $1" ;;
+    esac
+    shift
+  done
+}
+
+log()  { printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
+warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
+err()  { printf "\033[1;31m[x]\033[0m %s\n" "$*"; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+append_if_missing() {
+  local file="$1"
+  local line="$2"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  touch "$file"
+  grep -Fqx "$line" "$file" || printf "\n%s\n" "$line" >> "$file"
+}
+
+# Append a multi-line block once, guarded by a marker string
+append_block_if_missing() {
+  local file="$1"
+  local marker="$2"
+  local block="$3"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  touch "$file"
+  if grep -Fq "$marker" "$file"; then
+    log "Block already present in $file ($marker)"
+    return 0
+  fi
+  printf "\n%s\n" "$block" >> "$file"
+}
+
+# Replace a marker-delimited block in a file (P0-#6)
+replace_block() {
+  local file="$1"
+  local start_marker="$2"
+  local end_marker="$3"
+  local new_block="$4"
+
+  if [[ ! -f "$file" ]]; then
+    return 1
+  fi
+  if ! grep -Fq "$start_marker" "$file"; then
+    return 1
+  fi
+
+  local tmp
+  tmp="$(mktemp "${file}.XXXXXX")"
+  trap 'rm -f "$tmp"' RETURN
+
+  local inside=false
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"$start_marker"* ]]; then
+      inside=true
+      printf "%s\n" "$new_block"
+      continue
+    fi
+    if $inside; then
+      if [[ "$line" == *"$end_marker"* ]]; then
+        inside=false
+      fi
+      continue
+    fi
+    printf "%s\n" "$line"
+  done < "$file" > "$tmp"
+
+  mv "$tmp" "$file"
+  trap - RETURN
+}
+
+download_to() {
+  local url="$1"
+  local dest="$2"
+
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+
+  # Treat as local file if:
+  #  - file:// URL
+  #  - path exists as given
+  #  - or exists after expanding ~
+  if [[ "$url" == file://* ]]; then
+    local src="${url#file://}"
+    if [[ -f "$src" ]]; then
+      cp -f "$src" "$dest"
+      return 0
+    fi
+    err "Local file not found: $src"
+    return 1
+  fi
+
+  local expanded="$url"
+  [[ "$expanded" == "~"* ]] && expanded="${expanded/#\~/$HOME}"
+
+  if [[ -f "$url" || -f "$expanded" ]]; then
+    cp -f "${expanded:-$url}" "$dest"
+    return 0
+  fi
+
+  # Remote URL — download to temp file first, then mv on success (P1-#8)
+  local tmpfile
+  tmpfile="$(mktemp "$(dirname "$dest")/.dl.XXXXXX")"
+  trap 'rm -f "$tmpfile"' RETURN
+
+  if need_cmd curl; then
+    curl -fsSL "$url" -o "$tmpfile"
+  elif need_cmd wget; then
+    wget -qO "$tmpfile" "$url"
+  else
+    err "Need curl or wget to download: $url"
+    rm -f "$tmpfile"
+    trap - RETURN
+    return 1
+  fi
+
+  mv "$tmpfile" "$dest"
+  trap - RETURN
+}
+
+# Download a remote script to a temp file and execute it (P1-#9)
+# Replaces all curl | sh patterns for safety.
+download_and_run() {
+  local url="$1"
+  shift
+  local tmpscript
+  tmpscript="$(mktemp "${TMPDIR:-/tmp}/install-script.XXXXXX")"
+  trap 'rm -f "$tmpscript"' RETURN
+
+  if need_cmd curl; then
+    curl -fsSL "$url" -o "$tmpscript"
+  elif need_cmd wget; then
+    wget -qO "$tmpscript" "$url"
+  else
+    err "Need curl or wget to download: $url"
+    rm -f "$tmpscript"
+    trap - RETURN
+    return 1
+  fi
+
+  bash "$tmpscript" "$@"
+  local rc=$?
+  rm -f "$tmpscript"
+  trap - RETURN
+  return $rc
+}
+
+have_passwordless_sudo() { need_cmd sudo && sudo -n true >/dev/null 2>&1; }
+
+try_install_pkgs_no_password() {
+  local pkgs=("$@")
+
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if need_cmd brew; then
+      log "brew detected. Installing: ${pkgs[*]}"
+      brew install "${pkgs[@]}" >/dev/null || warn "brew install failed (continuing)."
+    else
+      warn "Homebrew not found. Skipping system package installs."
+    fi
+    return 0
+  fi
+
+  if have_passwordless_sudo; then
+    if need_cmd apt-get; then
+      log "Installing via apt (passwordless sudo): ${pkgs[*]}"
+      sudo -n apt-get update -y >/dev/null 2>&1 || true
+      sudo -n apt-get install -y "${pkgs[@]}" || warn "apt install failed (continuing)."
+    elif need_cmd dnf; then
+      log "Installing via dnf (passwordless sudo): ${pkgs[*]}"
+      sudo -n dnf install -y "${pkgs[@]}" || warn "dnf install failed (continuing)."
+    elif need_cmd pacman; then
+      log "Installing via pacman (passwordless sudo): ${pkgs[*]}"
+      sudo -n pacman -Sy --noconfirm "${pkgs[@]}" || warn "pacman install failed (continuing)."
+    else
+      warn "No supported package manager detected (apt/dnf/pacman)."
+    fi
+  else
+    warn "No passwordless sudo. Skipping system package installs."
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# CRITICAL FIX: bashrc compatibility shim
+# This prevents "command shopt not found" (and similar) when zsh sources ~/.bashrc.
+# ------------------------------------------------------------------------------
+add_bashrc_zsh_compat_shim() {
+  local bashrc="${HOME}/.bashrc"
+  touch "$bashrc"
+
+  if grep -q 'BASHRC_ZSH_COMPAT_SHIM' "$bashrc"; then
+    log "bashrc zsh-compat shim already present."
+    return 0
+  fi
+
+  log "Adding bashrc zsh-compat shim to avoid shopt/complete/bind errors in zsh."
+  # mktemp on same filesystem for atomic mv (P1-#13)
+  local tmp
+  tmp="$(mktemp "${HOME}/.bashrc.XXXXXX")"
+  trap 'rm -f "$tmp"' RETURN
+  cat > "$tmp" <<'EOF'
+# ---- BASHRC_ZSH_COMPAT_SHIM ----
+# This file is sometimes sourced by zsh for compatibility.
+# Bash-only builtins (shopt/complete/bind/...) will error in zsh unless we guard them.
+if [ -z "${BASH_VERSION:-}" ]; then
+  shopt()    { :; }
+  complete() { :; }
+  bind()     { :; }
+fi
+# ---- /BASHRC_ZSH_COMPAT_SHIM ----
+
+EOF
+  cat "$bashrc" >> "$tmp"
+  mv "$tmp" "$bashrc"
+  trap - RETURN
+}
+
+set_timezone() {
+  # Use a marker comment instead of empty string for append_if_missing (P2-#20)
+  append_if_missing "${HOME}/.config/shell/common.sh" "# -- timezone config --"
+  append_if_missing "${HOME}/.config/shell/common.sh" 'export TZ="Asia/Singapore"'
+  log 'Timezone set: export TZ="Asia/Singapore"'
+}
+
+setup_shared_shell_config() {
+  local common_dir="${HOME}/.config/shell"
+  local common_file="${common_dir}/common.sh"
+  mkdir -p "$common_dir"
+
+  if [[ ! -f "$common_file" ]]; then
+    log "Creating shared shell config: $common_file"
+    cat > "$common_file" <<'EOF'
+# Shared shell config sourced by both bash and zsh.
+
+# user local bins (uv installs here by default)
+export PATH="$HOME/.local/bin:$PATH"
+
+# nvm (installed by this script)
+export NVM_DIR="$HOME/.nvm"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$NVM_DIR/nvm.sh"
+fi
+EOF
+  else
+    log "Shared shell config exists: $common_file (leaving as-is)"
+  fi
+
+  append_if_missing "${HOME}/.bash_profile" '[[ -f ~/.bashrc ]] && . ~/.bashrc'
+  append_if_missing "${HOME}/.profile"      '[[ -f ~/.bashrc ]] && . ~/.bashrc'
+  append_if_missing "${HOME}/.bashrc"       '[[ -f ~/.config/shell/common.sh ]] && . ~/.config/shell/common.sh'
+
+  log "Configured bash to source ~/.config/shell/common.sh"
+}
+
+setup_uv_aliases() {
+  local common_file="${HOME}/.config/shell/common.sh"
+  local marker="UV_VENV_ALIASES"
+  local block
+  block="$(cat <<'BLOCK'
+# ---- UV_VENV_ALIASES ----
+# uv venv base directory
+UV_VENV_BASE="/local/${USER}/.uv_venv"
+
+# Helper: list available uv venvs
+_uv_env_list() {
+  if [[ ! -d "$UV_VENV_BASE" ]]; then
+    echo "(no venvs — $UV_VENV_BASE does not exist)"
+    return 1
+  fi
+  for d in "$UV_VENV_BASE"/*/bin/activate; do
+    [[ -f "$d" ]] && basename "$(dirname "$(dirname "$d")")"
+  done
+}
+
+# Validate venv name: no path traversal (P1-#11)
+_uv_validate_name() {
+  local name="$1"
+  if [[ "$name" == */* || "$name" == ..* ]]; then
+    echo "Invalid venv name: $name"
+    return 1
+  fi
+}
+
+# Wrapper: intercept custom subcommands, pass the rest to real uv
+uv() {
+  case "${1:-}" in
+    activate)
+      local name="${2:-}"
+      if [[ -z "$name" ]]; then
+        echo "Usage: uv activate <venv_name>"
+        echo "Available:"
+        _uv_env_list 2>/dev/null | sed 's/^/  /'
+        return 1
+      fi
+      _uv_validate_name "$name" || return 1
+      local activate="${UV_VENV_BASE}/${name}/bin/activate"
+      if [[ -f "$activate" ]]; then
+        source "$activate"
+      else
+        echo "No venv found: $activate"
+        return 1
+      fi
+      ;;
+    deactivate)
+      if typeset -f deactivate >/dev/null 2>&1; then
+        deactivate
+      else
+        echo "No venv is currently active"
+        return 1
+      fi
+      ;;
+    create)
+      local name="${2:-}"
+      if [[ -z "$name" ]]; then
+        echo "Usage: uv create <venv_name> [python_version]"
+        return 1
+      fi
+      _uv_validate_name "$name" || return 1
+      local venv_dir="${UV_VENV_BASE}/${name}"
+      if [[ -d "$venv_dir" ]]; then
+        echo "Venv already exists: $venv_dir"
+        return 1
+      fi
+      mkdir -p "$UV_VENV_BASE"
+      local py_flag=()
+      [[ -n "${3:-}" ]] && py_flag=(--python "$3")
+      command uv venv "${py_flag[@]}" "$venv_dir"
+      ;;
+    rm)
+      local name="${2:-}"
+      if [[ -z "$name" ]]; then
+        echo "Usage: uv rm <venv_name>"
+        echo "Available:"
+        _uv_env_list 2>/dev/null | sed 's/^/  /'
+        return 1
+      fi
+      _uv_validate_name "$name" || return 1
+      local venv_dir="${UV_VENV_BASE}/${name}"
+      if [[ ! -d "$venv_dir" ]]; then
+        echo "No venv found: $venv_dir"
+        return 1
+      fi
+      echo -n "Remove $venv_dir? [y/N] "
+      read -r reply
+      if [[ "$reply" =~ ^[Yy]$ ]]; then
+        rm -rf "$venv_dir"
+        echo "Removed $name"
+      else
+        echo "Cancelled"
+      fi
+      ;;
+    env)
+      case "${2:-}" in
+        list) _uv_env_list ;;
+        path)
+          local name="${3:-}"
+          if [[ -z "$name" ]]; then
+            echo "Usage: uv env path <venv_name>"
+            return 1
+          fi
+          local venv_dir="${UV_VENV_BASE}/${name}"
+          if [[ -d "$venv_dir" ]]; then
+            echo "$venv_dir"
+          else
+            echo "No venv found: $venv_dir"
+            return 1
+          fi
+          ;;
+        *) command uv "$@" ;;
+      esac
+      ;;
+    *)
+      command uv "$@"
+      ;;
+  esac
+}
+
+# Tab completion for custom uv subcommands
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  _uv_custom_complete() {
+    case "${words[2]}" in
+      activate|rm) compadd -- $(_uv_env_list 2>/dev/null) ;;
+      env)
+        case "${words[3]}" in
+          path) compadd -- $(_uv_env_list 2>/dev/null) ;;
+          *)    compadd -- list path ;;
+        esac ;;
+      *) return 1 ;;
+    esac
+  }
+  compdef _uv_custom_complete uv
+elif [[ -n "${BASH_VERSION:-}" ]]; then
+  _uv_custom_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local sub="${COMP_WORDS[1]}"
+    case "$sub" in
+      activate|rm) COMPREPLY=($(compgen -W "$(_uv_env_list 2>/dev/null)" -- "$cur")) ;;
+      env)
+        if [[ "${COMP_WORDS[2]}" == "path" ]]; then
+          COMPREPLY=($(compgen -W "$(_uv_env_list 2>/dev/null)" -- "$cur"))
+        else
+          COMPREPLY=($(compgen -W "list path" -- "$cur"))
+        fi ;;
+    esac
+  }
+  complete -F _uv_custom_complete uv
+fi
+
+# In zsh, `which` is a builtin that shows function bodies instead of binary
+# paths. Wrap it so `which uv` (and any other function that shadows a binary)
+# prints the binary path like users expect.
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  which() {
+    local arg
+    for arg in "$@"; do
+      if [[ "$(whence -w "$arg" 2>/dev/null)" == *function* ]]; then
+        whence -p "$arg" 2>/dev/null || { echo "$arg not found"; return 1; }
+      else
+        builtin which "$arg"
+      fi
+    done
+  }
+fi
+# ---- /UV_VENV_ALIASES ----
+BLOCK
+)"
+  append_block_if_missing "$common_file" "$marker" "$block"
+}
+
+install_uv() {
+  if need_cmd uv; then
+    log "uv already installed: $(uv --version || true)"
+    return 0
+  fi
+  log "Installing uv (user-space)"
+  need_cmd curl || try_install_pkgs_no_password curl
+  need_cmd curl || { err "curl not available; cannot install uv."; return 1; }
+  download_and_run "https://astral.sh/uv/install.sh"
+}
+
+# ---------------------------------------------------------------------------
+# Cache symlink management
+# Local drive is small (128G). Move heavy caches to /local and symlink back.
+# ---------------------------------------------------------------------------
+SHARED_LOCAL_BASE="/local/${USER}"
+
+# Generic helper: link a single directory to /local.
+#   link_cache_to_local <local_path> <shared_path>
+# - If <local_path> is already the correct symlink → skip.
+# - If <local_path> is a real dir with data → move contents to <shared_path>.
+# - Creates <shared_path> and symlinks <local_path> → <shared_path>.
+link_cache_to_local() {
+  local local_path="$1"
+  local shared_path="$2"
+
+  # Verify /local is usable before touching anything
+  if ! mkdir -p "$shared_path" 2>/dev/null; then
+    warn "Cannot create $shared_path (skipping)"
+    return 0
+  fi
+  if [[ ! -w "$shared_path" ]]; then
+    warn "Not writable: $shared_path (skipping)"
+    return 0
+  fi
+
+  # Already correct
+  if [[ -L "$local_path" ]] && [[ "$(readlink "$local_path")" == "$shared_path" ]]; then
+    return 0
+  fi
+
+  # local_path is a real directory with data → migrate first
+  if [[ -d "$local_path" && ! -L "$local_path" ]]; then
+    log "Migrating existing data: $local_path -> $shared_path"
+    # rsync preserves permissions; trailing / means "contents of"
+    if need_cmd rsync; then
+      rsync -a "$local_path/" "$shared_path/"
+    else
+      cp -a "$local_path/." "$shared_path/"
+    fi
+    rm -rf "$local_path"
+  fi
+
+  mkdir -p "$(dirname "$local_path")"
+  ln -sfn "$shared_path" "$local_path"
+  log "Linked: $local_path -> $shared_path"
+}
+
+# Ensure all heavy cache / data dirs live on /local.
+# Called unconditionally from main() so links stay correct across re-runs.
+ensure_cache_symlinks() {
+  log "Ensuring caches are symlinked to /local ..."
+
+  # Quick check: is /local available at all?
+  if [[ ! -d "/local" ]]; then
+    warn "/local does not exist — skipping cache symlinks."
+    return 0
+  fi
+
+  # ~/.cache/<tool>
+  local cache_dirs=(
+    uv
+    pip
+    huggingface
+    torch
+    npm
+    yarn
+    go-build
+    go/mod
+  )
+  for d in "${cache_dirs[@]}"; do
+    link_cache_to_local "${HOME}/.cache/${d}" "${SHARED_LOCAL_BASE}/.cache/${d}"
+  done
+
+  # Standalone data dirs that grow large
+  link_cache_to_local "${HOME}/.local/share/uv"    "${SHARED_LOCAL_BASE}/.local/share/uv"
+  link_cache_to_local "${HOME}/.conda"              "${SHARED_LOCAL_BASE}/.conda"
+  link_cache_to_local "${HOME}/.triton"             "${SHARED_LOCAL_BASE}/.triton"
+}
+
+ensure_zsh_exists() {
+  if need_cmd zsh; then
+    log "zsh found: $(command -v zsh)"
+    return 0
+  fi
+  warn "zsh not found. Trying to install without password..."
+  try_install_pkgs_no_password zsh
+  need_cmd zsh || { err "zsh is required but couldn't be installed without admin rights."; return 1; }
+}
+
+install_oh_my_zsh() {
+  local omz_dir="${HOME}/.oh-my-zsh"
+  local sentinel="${omz_dir}/oh-my-zsh.sh"
+
+  # Validate installation health: directory must exist AND contain sentinel (P0-#3)
+  if [[ -d "$omz_dir" ]]; then
+    if [[ -f "$sentinel" ]]; then
+      log "Oh My Zsh already installed."
+      return 0
+    fi
+    warn "Oh My Zsh directory exists but sentinel missing ($sentinel). Re-installing."
+    rm -rf "$omz_dir"
+  fi
+
+  log "Installing Oh My Zsh (unattended, no chsh)"
+  export RUNZSH=no CHSH=no KEEP_ZSHRC=yes
+  need_cmd curl || try_install_pkgs_no_password curl
+  need_cmd curl || { err "curl not available; cannot install Oh My Zsh."; return 1; }
+  download_and_run "https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+}
+
+# Add tmux + JetBrains/JediTerm fix block to ~/.zshrc (once)
+add_tmux_jediterm_fix_to_zshrc() {
+  local zshrc="${HOME}/.zshrc"
+  local marker="ZSH_TMUX_JEDITERM_FIX"
+  touch "$zshrc"
+
+  local block
+  block="$(cat <<'EOF'
+# ---- ZSH_TMUX_JEDITERM_FIX ----
+# tmux configuration - fix intellij terminal bug
+if [[ -n "$TMUX" ]]; then
+  tmux set -g status-position top 2>/dev/null
+
+  # Fix JediTerm DA1 response leak (prints "6c" in prompt)
+  # Only applies to IntelliJ/JediTerm terminal
+  if [[ "$TERMINAL_EMULATOR" == "JetBrains-JediTerm" ]]; then
+    while read -t 0.01 -k discard; do :; done
+    clear
+  fi
+  # tmux set -g status-position bottom 2>/dev/null
+fi
+# ---- /ZSH_TMUX_JEDITERM_FIX ----
+EOF
+)"
+  append_block_if_missing "$zshrc" "$marker" "$block"
+}
+
+install_p10k_and_plugins() {
+  local zsh_custom="${ZSH_CUSTOM:-${HOME}/.oh-my-zsh/custom}"
+  mkdir -p "$zsh_custom/plugins" "$zsh_custom/themes"
+
+  need_cmd git || try_install_pkgs_no_password git
+  need_cmd git || { err "git not available; cannot install OMZ plugins/themes."; return 1; }
+
+  # Helper: clone or verify health of a git repo (P0-#3, P1-#10)
+  _ensure_clone() {
+    local dir="$1"
+    local repo="$2"
+    local tag="${3:-}"
+
+    if [[ -d "$dir" ]]; then
+      # Health check: verify the clone is intact
+      if git -C "$dir" rev-parse HEAD >/dev/null 2>&1; then
+        log "Already cloned: $dir"
+        return 0
+      fi
+      warn "Broken clone detected at $dir — removing and re-cloning."
+      rm -rf "$dir"
+    fi
+
+    local clone_args=(--depth=1)
+    [[ -n "$tag" ]] && clone_args+=(--branch "$tag")
+    git clone "${clone_args[@]}" "$repo" "$dir"
+  }
+
+  _ensure_clone "$zsh_custom/themes/powerlevel10k" \
+    "https://github.com/romkatv/powerlevel10k.git" "$P10K_TAG"
+
+  _ensure_clone "$zsh_custom/plugins/zsh-autosuggestions" \
+    "https://github.com/zsh-users/zsh-autosuggestions" "$ZSH_AUTOSUGG_TAG"
+
+  _ensure_clone "$zsh_custom/plugins/zsh-syntax-highlighting" \
+    "https://github.com/zsh-users/zsh-syntax-highlighting.git" "$ZSH_SYNTAX_HL_TAG"
+
+  local zshrc="${HOME}/.zshrc"
+  touch "$zshrc"
+
+  append_if_missing "$zshrc" '[[ -f ~/.config/shell/common.sh ]] && source ~/.config/shell/common.sh'
+  append_if_missing "$zshrc" 'export ZSH="$HOME/.oh-my-zsh"'
+  append_if_missing "$zshrc" 'ZSH_THEME="powerlevel10k/powerlevel10k"'
+  append_if_missing "$zshrc" 'plugins=(git zsh-autosuggestions zsh-syntax-highlighting)'
+  append_if_missing "$zshrc" 'source "$ZSH/oh-my-zsh.sh"'
+
+  if ! grep -q 'ZSH_BASHRC_COMPAT' "$zshrc"; then
+    cat >> "$zshrc" <<'EOF'
+
+# ---- ZSH_BASHRC_COMPAT ----
+# Some installers only append exports/PATH to ~/.bashrc. Keep zsh in sync.
+if [[ -z "${ZSH_BASHRC_COMPAT:-}" ]]; then
+  export ZSH_BASHRC_COMPAT=1
+  [[ -f ~/.bashrc ]] && source ~/.bashrc
+fi
+EOF
+  fi
+
+  # p10k config — only overwrite if file doesn't already exist (P1-#12)
+  if [[ -f "${HOME}/.p10k.zsh" ]]; then
+    log "p10k config already exists (~/.p10k.zsh); leaving as-is."
+  elif [[ -n "${P10K_CONFIG_PATH:-}" && -f "${P10K_CONFIG_PATH}" ]]; then
+    cp "${P10K_CONFIG_PATH}" "${HOME}/.p10k.zsh"
+  elif [[ -n "${P10K_CONFIG_URL:-}" ]]; then
+    download_to "${P10K_CONFIG_URL}" "${HOME}/.p10k.zsh"
+  else
+    cat > "${HOME}/.p10k.zsh" <<'EOF'
+# Minimal placeholder; replace with your own or run `p10k configure`
+typeset -g POWERLEVEL9K_MODE=nerdfont-complete
+EOF
+  fi
+
+  # Keep the p10k sourcing line
+  append_if_missing "$zshrc" '[[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh'
+
+  # Add tmux + JetBrains/JediTerm fix block to ~/.zshrc
+  add_tmux_jediterm_fix_to_zshrc
+}
+
+install_oh_my_tmux() {
+  # Modern oh-my-tmux installs to ~/.local/share/tmux/oh-my-tmux/
+  # and symlinks ~/.config/tmux/tmux.conf -> there.
+  # Legacy installs used ~/.tmux/.tmux.conf.
+  local sentinel="${HOME}/.config/tmux/tmux.conf"
+  local legacy_sentinel="${HOME}/.tmux/.tmux.conf"
+
+  # Validate: either modern or legacy sentinel must exist
+  if [[ -f "$sentinel" ]] || [[ -f "$legacy_sentinel" ]]; then
+    log "oh-my-tmux already installed."
+    return 0
+  fi
+
+  # Directory exists but sentinel missing — broken install
+  if [[ -d "${HOME}/.local/share/tmux/oh-my-tmux" ]]; then
+    warn "oh-my-tmux data dir exists but sentinel missing. Re-installing."
+    rm -rf "${HOME}/.local/share/tmux/oh-my-tmux"
+  fi
+
+  log "Installing oh-my-tmux (official installer)"
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl is required to install oh-my-tmux"
+    return 1
+  fi
+
+  # Use download_and_run instead of curl | bash; no cache-bust fragment (P2-#16, P1-#9)
+  download_and_run "https://github.com/gpakosz/.tmux/raw/refs/heads/master/install.sh"
+}
+
+install_tmux_local_config() {
+  local dest="${HOME}/.config/tmux/tmux.conf.local"
+
+  if [[ -n "${TMUX_LOCAL_CONFIG_PATH:-}" && -f "${TMUX_LOCAL_CONFIG_PATH}" ]]; then
+    log "Installing tmux local config from file"
+    mkdir -p "$(dirname "$dest")"
+    cp "$TMUX_LOCAL_CONFIG_PATH" "$dest"
+
+  elif [[ -n "${TMUX_LOCAL_CONFIG_URL:-}" ]]; then
+    log "Installing tmux local config from URL"
+    download_to "$TMUX_LOCAL_CONFIG_URL" "$dest"
+
+  else
+    log "No tmux local config provided; leaving default."
+    return 0
+  fi
+
+  chmod 0644 "$dest"
+  # Removed destructive ln -sf that overwrote tmux.conf (P0-#2)
+  # oh-my-tmux auto-sources tmux.conf.local; reload from correct path
+  tmux source-file "${HOME}/.config/tmux/tmux.conf.local" 2>/dev/null || true
+}
+
+install_nvm_and_node() {
+  local nvm_dir="${HOME}/.nvm"
+  local sentinel="${nvm_dir}/nvm.sh"
+
+  # Validate: directory AND sentinel must exist (P0-#3)
+  if [[ -d "$nvm_dir" ]] && [[ ! -s "$sentinel" ]]; then
+    warn "nvm directory exists but sentinel missing ($sentinel). Re-installing."
+    rm -rf "$nvm_dir"
+  fi
+
+  if [[ ! -d "$nvm_dir" ]]; then
+    need_cmd curl || try_install_pkgs_no_password curl
+    need_cmd curl || { err "curl not available; cannot install nvm."; return 1; }
+    # Use pinned NVM_VERSION and download_and_run (P1-#15, P1-#9)
+    download_and_run "https://raw.githubusercontent.com/nvm-sh/nvm/${NVM_VERSION}/install.sh"
+  fi
+
+  export NVM_DIR="$nvm_dir"
+  [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh"
+
+  if need_cmd nvm; then
+    nvm install --lts >/dev/null || warn "nvm install --lts failed (continuing)."
+    nvm alias default 'lts/*' >/dev/null || true
+  else
+    warn "nvm not available in this session; open a new shell and run: nvm install --lts"
+  fi
+}
+
+enable_bash_to_zsh_handoff() {
+  local bashrc="${HOME}/.bashrc"
+  touch "$bashrc"
+
+  if grep -q 'BASH_TO_ZSH_HANDOFF' "$bashrc"; then
+    log "bash->zsh handoff already configured."
+    return 0
+  fi
+
+  log "Configuring bash to exec into zsh for interactive terminals (no chsh)"
+  cat >> "$bashrc" <<'EOF'
+
+# ---- BASH_TO_ZSH_HANDOFF ----
+if [[ -z "${BASH_TO_ZSH_HANDOFF:-}" ]]; then
+  export BASH_TO_ZSH_HANDOFF=1
+  case $- in
+    *i*)
+      if command -v zsh >/dev/null 2>&1; then
+        # Avoid loops if zsh sources bashrc
+        if [[ -z "${ZSH_BASHRC_COMPAT:-}" ]]; then
+          exec zsh -l
+        fi
+      fi
+      ;;
+  esac
+fi
+EOF
+}
+
+# --check mode: describe what would be done without making changes (P0-#6)
+run_check_mode() {
+  log "Running in --check mode (dry run)"
+  echo
+  echo "Installed version: $(cat "$INSTALL_STATE_FILE" 2>/dev/null || echo 'none')"
+  echo "Script  version:   $INSTALL_VERSION"
+  echo
+
+  local checks=(
+    "git:git"
+    "curl:curl"
+    "shared shell config:${HOME}/.config/shell/common.sh"
+    "bashrc zsh-compat shim:BASHRC_ZSH_COMPAT_SHIM in ${HOME}/.bashrc"
+    "timezone:TZ in ${HOME}/.config/shell/common.sh"
+    "uv:uv"
+    "zsh:zsh"
+    "oh-my-zsh:${HOME}/.oh-my-zsh/oh-my-zsh.sh"
+    "powerlevel10k:${HOME}/.oh-my-zsh/custom/themes/powerlevel10k"
+    "zsh-autosuggestions:${HOME}/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
+    "zsh-syntax-highlighting:${HOME}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
+    "oh-my-tmux:${HOME}/.config/tmux/tmux.conf"
+    "nvm:${HOME}/.nvm/nvm.sh"
+  )
+
+  for entry in "${checks[@]}"; do
+    local label="${entry%%:*}"
+    local target="${entry#*:}"
+
+    if need_cmd "$label" 2>/dev/null || [[ -e "$target" ]]; then
+      printf "  %-35s %s\n" "$label" "[OK]"
+    else
+      printf "  %-35s %s\n" "$label" "[MISSING — would install]"
+    fi
+  done
+
+  # Cache symlink status
+  echo
+  echo "  Cache symlinks (/local):"
+  local cache_dirs=(uv pip huggingface torch npm yarn go-build go/mod)
+  for d in "${cache_dirs[@]}"; do
+    local p="${HOME}/.cache/${d}"
+    if [[ -L "$p" ]]; then
+      printf "    %-33s %s\n" "~/.cache/$d" "[OK -> $(readlink "$p")]"
+    elif [[ -d "$p" ]]; then
+      printf "    %-33s %s\n" "~/.cache/$d" "[EXISTS — would migrate & link]"
+    else
+      printf "    %-33s %s\n" "~/.cache/$d" "[absent]"
+    fi
+  done
+  local extra_dirs=("${HOME}/.local/share/uv" "${HOME}/.conda" "${HOME}/.triton")
+  for p in "${extra_dirs[@]}"; do
+    local short="${p/#"$HOME"/~}"
+    if [[ -L "$p" ]]; then
+      printf "    %-33s %s\n" "$short" "[OK -> $(readlink "$p")]"
+    elif [[ -d "$p" ]]; then
+      printf "    %-33s %s\n" "$short" "[EXISTS — would migrate & link]"
+    else
+      printf "    %-33s %s\n" "$short" "[absent]"
+    fi
+  done
+
+  echo
+  if [[ -f "$INSTALL_STATE_FILE" ]] && [[ "$(cat "$INSTALL_STATE_FILE")" == "$INSTALL_VERSION" ]]; then
+    log "Version $INSTALL_VERSION is already installed. Use --force to re-run."
+  else
+    log "Would run full install (version $INSTALL_VERSION)."
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  # Warn if running as root (P2-#19)
+  [[ ${EUID:-$(id -u)} -eq 0 ]] && warn "Running as root is not recommended."
+
+  # --check: dry-run mode (P0-#6)
+  if $CHECK_MODE; then
+    run_check_mode
+    return 0
+  fi
+
+  # Version tracking: skip if already up-to-date unless --force (P0-#6)
+  mkdir -p "$INSTALL_STATE_DIR"
+  if [[ -f "$INSTALL_STATE_FILE" ]] && ! $FORCE_MODE; then
+    local installed_version
+    installed_version="$(cat "$INSTALL_STATE_FILE")"
+    if [[ "$installed_version" == "$INSTALL_VERSION" ]]; then
+      log "Already at version $INSTALL_VERSION. Use --force to re-run."
+      return 0
+    fi
+    log "Upgrading from $installed_version to $INSTALL_VERSION"
+  fi
+
+  log "No-password setup: bash stays default; interactive terminals jump into zsh."
+
+  need_cmd git  || try_install_pkgs_no_password git
+  need_cmd curl || try_install_pkgs_no_password curl
+
+  setup_shared_shell_config
+  add_bashrc_zsh_compat_shim
+  set_timezone
+  install_uv
+  ensure_cache_symlinks
+  setup_uv_aliases
+
+  ensure_zsh_exists
+  install_oh_my_zsh
+  install_p10k_and_plugins
+  install_oh_my_tmux
+  install_tmux_local_config
+  install_nvm_and_node
+  enable_bash_to_zsh_handoff
+
+  # Write version marker after successful completion (P0-#6)
+  printf "%s" "$INSTALL_VERSION" > "$INSTALL_STATE_FILE"
+
+  log "Done. (version $INSTALL_VERSION)"
+  echo
+  echo "What changes were made:"
+  echo "  - bash remains your login shell (no chsh / no password)"
+  echo "  - interactive bash now execs into: zsh -l"
+  echo "  - both bash and zsh source: ~/.config/shell/common.sh"
+  echo "  - zsh also sources ~/.bashrc (guarded) so installers that edit bashrc still apply"
+  echo "  - zsh adds tmux + JetBrains/JediTerm fix (guarded, no duplicates)"
+  echo
+  echo "Next steps:"
+  echo "  1) Open a NEW terminal (or run: source ~/.bashrc)"
+  echo "  2) Verify:"
+  echo "     - uv --version"
+  echo "     - node -v && npm -v"
+  echo "     - zsh --version"
+  echo "     - tmux -V (if installed)"
+  echo "  3) If you didn't provide a p10k config, run: p10k configure"
+}
+
+main "$@"
