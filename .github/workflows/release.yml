@@ -40,17 +40,18 @@ jobs:
           gh release create "v${{ steps.version.outputs.version }}" \
             install-standalone.sh \
             --title "v${{ steps.version.outputs.version }}" \
-            --notes "$(cat <<'EOF'
+            --notes "$(cat <<EOF
           ## Quick install
 
-          ```bash
+          **Public repo:**
+          \`\`\`bash
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/install-standalone.sh | bash
-          ```
+          \`\`\`
 
-          Dry-run:
-          ```bash
+          Dry-run (append \`--check\`):
+          \`\`\`bash
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/install-standalone.sh | bash -s -- --check
-          ```
+          \`\`\`
           EOF
           )"
         env:

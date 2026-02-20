@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-INSTALL_VERSION="1.0.0"
+INSTALL_VERSION="1.0.1"
 INSTALL_STATE_DIR="${HOME}/.config/shell"
 INSTALL_STATE_FILE="${INSTALL_STATE_DIR}/install-version"
 
@@ -831,7 +831,17 @@ run_check_mode() {
     local label="${entry%%:*}"
     local target="${entry#*:}"
 
-    if need_cmd "$label" 2>/dev/null || [[ -e "$target" ]]; then
+    local found=false
+    if need_cmd "$label" 2>/dev/null; then
+      found=true
+    elif [[ "$target" == *" in "* ]]; then
+      local marker="${target%% in *}"
+      local file="${target#* in }"
+      [[ -f "$file" ]] && grep -q "$marker" "$file" && found=true
+    elif [[ -e "$target" ]]; then
+      found=true
+    fi
+    if "$found"; then
       printf "  %-35s %s\n" "$label" "[OK]"
     else
       printf "  %-35s %s\n" "$label" "[MISSING — would install]"
