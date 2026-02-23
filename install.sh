@@ -570,7 +570,7 @@ install_yazi() {
   esac
 
   case "$os" in
-    Linux)  target="${target_arch}-unknown-linux-gnu" ;;
+    Linux)  target="${target_arch}-unknown-linux-musl" ;;
     Darwin) target="${target_arch}-apple-darwin" ;;
     *)      warn "Unsupported OS for yazi: $os. Skipping."; return 0 ;;
   esac
