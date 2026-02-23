@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 - yazi and wezterm entries in `--check` dry-run mode
 - yazi and wezterm in post-install verification summary
 
+### Fixed
+
+- Use musl (statically linked) build for yazi on Linux to avoid glibc version mismatch
+
 ## [1.0.2] - 2026-02-23
 
 ### Fixed
