@@ -530,6 +530,20 @@ install_yazi() {
     fi
   fi
 
+  # Optional dependencies for media preview
+  local yazi_opt_deps=(ffmpeg chafa)
+  local missing_opt=()
+  for dep in "${yazi_opt_deps[@]}"; do
+    need_cmd "$dep" || missing_opt+=("$dep")
+  done
+  if [[ ${#missing_opt[@]} -gt 0 ]]; then
+    log "yazi optional deps missing: ${missing_opt[*]}"
+    try_install_pkgs_no_password "${missing_opt[@]}"
+    for dep in "${missing_opt[@]}"; do
+      need_cmd "$dep" || warn "Optional: '$dep' not installed (yazi media preview may be limited)"
+    done
+  fi
+
   # macOS: prefer brew
   if [[ "$(uname -s)" == "Darwin" ]]; then
     if need_cmd brew; then
