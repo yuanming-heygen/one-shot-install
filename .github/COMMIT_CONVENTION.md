@@ -33,7 +33,7 @@
 ## Examples
 
 ```
-✨ [uv] Add custom venv management aliases
+:sparkles: [uv] Add custom venv management aliases
 
 - Add uv activate/deactivate/create/rm subcommands
 - Add tab completion for zsh and bash
@@ -41,28 +41,28 @@
 ```
 
 ```
-🐛 [tmux] Fix oh-my-tmux config symlink overwrite
+:bug: [tmux] Fix oh-my-tmux config symlink overwrite
 
 - Remove destructive ln -sf that overwrote tmux.conf
 - Reload from tmux.conf.local path instead
 ```
 
 ```
-📝 [docs] Add README and CLAUDE.md
+:memo: [docs] Add README and CLAUDE.md
 
 - Add project README with install instructions
 - Add CLAUDE.md for Claude Code context
 ```
 
 ```
-⬆️ [nvm] Bump nvm to v0.40.4
+:arrow_up: [nvm] Bump nvm to v0.40.4
 
 - Update NVM_VERSION pin
 - No breaking changes
 ```
 
 ```
-🔧 [shell] Set default timezone to Asia/Singapore
+:wrench: [shell] Set default timezone to Asia/Singapore
 
 - Append TZ export to shared shell config
 ```
