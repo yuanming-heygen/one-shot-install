@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-INSTALL_VERSION="1.0.1"
+INSTALL_VERSION="1.0.3"
 INSTALL_STATE_DIR="${HOME}/.config/shell"
 INSTALL_STATE_FILE="${INSTALL_STATE_DIR}/install-version"
 
@@ -49,6 +49,30 @@ warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
 err()  { printf "\033[1;31m[x]\033[0m %s\n" "$*"; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Strip carriage returns from a file in-place (fixes CRLF on WSL)
+strip_cr() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  if LC_ALL=C grep -q $'\r' "$file" 2>/dev/null; then
+    local tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    tr -d '\r' < "$file" > "$tmp" && mv "$tmp" "$file"
+  fi
+}
+
+# Set core.autocrlf=false in a git repo and re-checkout to fix CRLF files
+fix_git_autocrlf() {
+  local repo_dir="$1"
+  [[ -d "$repo_dir/.git" || -f "$repo_dir/.git" ]] || return 0
+  local current
+  current="$(git -C "$repo_dir" config --local core.autocrlf 2>/dev/null || echo "")"
+  [[ "$current" == "false" ]] && return 0
+  log "Fixing CRLF line endings in $repo_dir"
+  git -C "$repo_dir" config core.autocrlf false
+  git -C "$repo_dir" rm --cached -r . >/dev/null 2>&1 || true
+  git -C "$repo_dir" reset --hard HEAD >/dev/null 2>&1 || true
+}
 
 append_if_missing() {
   local file="$1"
@@ -124,6 +148,7 @@ download_to() {
     local src="${url#file://}"
     if [[ -f "$src" ]]; then
       cp -f "$src" "$dest"
+      strip_cr "$dest"
       return 0
     fi
     err "Local file not found: $src"
@@ -135,6 +160,7 @@ download_to() {
 
   if [[ -f "$url" || -f "$expanded" ]]; then
     cp -f "${expanded:-$url}" "$dest"
+    strip_cr "$dest"
     return 0
   fi
 
@@ -259,6 +285,15 @@ set_timezone() {
   append_if_missing "${HOME}/.config/shell/common.sh" "# -- timezone config --"
   append_if_missing "${HOME}/.config/shell/common.sh" 'export TZ="Asia/Singapore"'
   log 'Timezone set: export TZ="Asia/Singapore"'
+}
+
+setup_git_credential_store() {
+  if git config --global credential.helper | grep -q store; then
+    log "git credential.helper already set to store."
+    return
+  fi
+  git config --global credential.helper store
+  log "git credential.helper set to store."
 }
 
 setup_shared_shell_config() {
@@ -640,7 +675,7 @@ install_p10k_and_plugins() {
 
     local clone_args=(--depth=1)
     [[ -n "$tag" ]] && clone_args+=(--branch "$tag")
-    git clone "${clone_args[@]}" "$repo" "$dir"
+    git -c core.autocrlf=false clone "${clone_args[@]}" "$repo" "$dir"
   }
 
   _ensure_clone "$zsh_custom/themes/powerlevel10k" \
@@ -817,6 +852,7 @@ run_check_mode() {
     "shared shell config:${HOME}/.config/shell/common.sh"
     "bashrc zsh-compat shim:BASHRC_ZSH_COMPAT_SHIM in ${HOME}/.bashrc"
     "timezone:TZ in ${HOME}/.config/shell/common.sh"
+    "git credential store:cmd:git config --global credential.helper | grep -q store"
     "uv:uv"
     "zsh:zsh"
     "oh-my-zsh:${HOME}/.oh-my-zsh/oh-my-zsh.sh"
@@ -834,6 +870,8 @@ run_check_mode() {
     local found=false
     if need_cmd "$label" 2>/dev/null; then
       found=true
+    elif [[ "$target" == cmd:* ]]; then
+      eval "${target#cmd:}" 2>/dev/null && found=true
     elif [[ "$target" == *" in "* ]]; then
       local marker="${target%% in *}"
       local file="${target#* in }"
@@ -874,12 +912,88 @@ run_check_mode() {
     fi
   done
 
+  # CRLF check
+  echo
+  echo "  CRLF line endings (WSL fix):"
+  local crlf_found=false
+  local crlf_configs=(
+    "${HOME}/.bashrc"
+    "${HOME}/.zshrc"
+    "${HOME}/.p10k.zsh"
+    "${HOME}/.config/shell/common.sh"
+  )
+  for f in "${crlf_configs[@]}"; do
+    local short="${f/#"$HOME"/~}"
+    if [[ -f "$f" ]] && LC_ALL=C grep -q $'\r' "$f" 2>/dev/null; then
+      printf "    %-33s %s\n" "$short" "[HAS CRLF — would fix]"
+      crlf_found=true
+    elif [[ -f "$f" ]]; then
+      printf "    %-33s %s\n" "$short" "[OK]"
+    fi
+  done
+  local zsh_custom="${ZSH_CUSTOM:-${HOME}/.oh-my-zsh/custom}"
+  local crlf_repos=(
+    "${HOME}/.oh-my-zsh"
+    "$zsh_custom/themes/powerlevel10k"
+    "$zsh_custom/plugins/zsh-autosuggestions"
+    "$zsh_custom/plugins/zsh-syntax-highlighting"
+  )
+  for r in "${crlf_repos[@]}"; do
+    local short="${r/#"$HOME"/~}"
+    if [[ -d "$r" ]] && [[ "$(git -C "$r" config --local core.autocrlf 2>/dev/null)" != "false" ]]; then
+      printf "    %-33s %s\n" "$short" "[autocrlf not fixed — would fix]"
+      crlf_found=true
+    elif [[ -d "$r" ]]; then
+      printf "    %-33s %s\n" "$short" "[OK]"
+    fi
+  done
+  if ! $crlf_found; then
+    echo "    (no CRLF issues detected)"
+  fi
+
   echo
   if [[ -f "$INSTALL_STATE_FILE" ]] && [[ "$(cat "$INSTALL_STATE_FILE")" == "$INSTALL_VERSION" ]]; then
     log "Version $INSTALL_VERSION is already installed. Use --force to re-run."
   else
     log "Would run full install (version $INSTALL_VERSION)."
   fi
+}
+
+# ---------------------------------------------------------------------------
+# CRLF fix: on WSL with git core.autocrlf=true, cloned files get \r\n line
+# endings which break zsh init scripts (^M errors). This step:
+#   1) strips \r from all managed shell config files
+#   2) sets core.autocrlf=false in cloned zsh plugin repos and re-checks out
+# Safe to run on any platform — LF-only files are left unchanged.
+# ---------------------------------------------------------------------------
+fix_line_endings() {
+  log "Ensuring LF line endings in shell configs and plugins (CRLF/WSL fix) ..."
+
+  # 1) Fix shell config files
+  local configs=(
+    "${HOME}/.bashrc"
+    "${HOME}/.bash_profile"
+    "${HOME}/.profile"
+    "${HOME}/.zshrc"
+    "${HOME}/.p10k.zsh"
+    "${HOME}/.config/shell/common.sh"
+    "${HOME}/.config/tmux/tmux.conf.local"
+  )
+  for f in "${configs[@]}"; do
+    strip_cr "$f"
+  done
+
+  # 2) Fix git repos sourced by zsh
+  local zsh_custom="${ZSH_CUSTOM:-${HOME}/.oh-my-zsh/custom}"
+  local repos=(
+    "${HOME}/.oh-my-zsh"
+    "$zsh_custom/themes/powerlevel10k"
+    "$zsh_custom/plugins/zsh-autosuggestions"
+    "$zsh_custom/plugins/zsh-syntax-highlighting"
+  )
+  for r in "${repos[@]}"; do
+    fix_git_autocrlf "$r"
+  done
 }
 
 main() {
@@ -914,6 +1028,7 @@ main() {
   setup_shared_shell_config
   add_bashrc_zsh_compat_shim
   set_timezone
+  setup_git_credential_store
   install_uv
   ensure_cache_symlinks
   setup_uv_aliases
@@ -925,6 +1040,7 @@ main() {
   install_tmux_local_config
   install_nvm_and_node
   enable_bash_to_zsh_handoff
+  fix_line_endings
 
   # Write version marker after successful completion (P0-#6)
   printf "%s" "$INSTALL_VERSION" > "$INSTALL_STATE_FILE"
