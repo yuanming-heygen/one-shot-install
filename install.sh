@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-INSTALL_VERSION="1.0.2"
+INSTALL_VERSION="1.1.0"
 INSTALL_STATE_DIR="${HOME}/.config/shell"
 INSTALL_STATE_FILE="${INSTALL_STATE_DIR}/install-version"
 
@@ -28,6 +28,8 @@ NVM_VERSION="v0.40.4"
 P10K_TAG="v1.20.0"
 ZSH_AUTOSUGG_TAG="v0.7.1"
 ZSH_SYNTAX_HL_TAG="0.8.0"
+YAZI_VERSION="v26.1.22"
+WEZTERM_VERSION="20240203-110809-5046fc22"
 
 # Flags (set by parse_args)
 CHECK_MODE=false
@@ -513,6 +515,119 @@ install_uv() {
   download_and_run "https://astral.sh/uv/install.sh"
 }
 
+install_yazi() {
+  if need_cmd yazi; then
+    log "yazi already installed: $(yazi --version 2>/dev/null || true)"
+    return 0
+  fi
+
+  # Required dependency: file(1)
+  if ! need_cmd file; then
+    try_install_pkgs_no_password file
+    if ! need_cmd file; then
+      warn "'file' command required by yazi but not available. Skipping yazi."
+      return 0
+    fi
+  fi
+
+  # macOS: prefer brew
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if need_cmd brew; then
+      log "Installing yazi via brew"
+      brew install yazi >/dev/null || warn "brew install yazi failed (continuing)."
+      return 0
+    fi
+  fi
+
+  # Linux with sudo: try package manager first
+  if [[ "$(uname -s)" != "Darwin" ]] && have_passwordless_sudo; then
+    if need_cmd apt-get; then
+      sudo -n apt-get install -y yazi >/dev/null 2>&1 && { log "yazi installed via apt."; return 0; } || true
+    elif need_cmd dnf; then
+      sudo -n dnf install -y yazi >/dev/null 2>&1 && { log "yazi installed via dnf."; return 0; } || true
+    fi
+  fi
+
+  # Binary download (works on both macOS and Linux without sudo)
+  log "Installing yazi ${YAZI_VERSION} from GitHub release"
+
+  if ! need_cmd unzip; then
+    try_install_pkgs_no_password unzip
+    if ! need_cmd unzip; then
+      warn "unzip not available. Cannot extract yazi. Skipping."
+      return 0
+    fi
+  fi
+
+  local os arch target_arch target
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$arch" in
+    x86_64)         target_arch="x86_64" ;;
+    aarch64|arm64)  target_arch="aarch64" ;;
+    *)              warn "Unsupported architecture for yazi: $arch. Skipping."; return 0 ;;
+  esac
+
+  case "$os" in
+    Linux)  target="${target_arch}-unknown-linux-gnu" ;;
+    Darwin) target="${target_arch}-apple-darwin" ;;
+    *)      warn "Unsupported OS for yazi: $os. Skipping."; return 0 ;;
+  esac
+
+  local url="https://github.com/sxyazi/yazi/releases/download/${YAZI_VERSION}/yazi-${target}.zip"
+  local tmpdir
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/yazi-install.XXXXXX")"
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  download_to "$url" "${tmpdir}/yazi.zip"
+  unzip -q "${tmpdir}/yazi.zip" -d "$tmpdir"
+
+  mkdir -p "${HOME}/.local/bin"
+  cp "${tmpdir}/yazi-${target}/yazi" "${HOME}/.local/bin/yazi"
+  cp "${tmpdir}/yazi-${target}/ya" "${HOME}/.local/bin/ya"
+  chmod +x "${HOME}/.local/bin/yazi" "${HOME}/.local/bin/ya"
+
+  rm -rf "$tmpdir"
+  trap - RETURN
+  log "yazi ${YAZI_VERSION} installed to ~/.local/bin/"
+}
+
+install_wezterm() {
+  if need_cmd wezterm; then
+    log "wezterm already installed: $(wezterm --version 2>/dev/null || true)"
+    return 0
+  fi
+
+  # macOS: brew
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if need_cmd brew; then
+      log "Installing wezterm via brew"
+      brew install --cask wezterm >/dev/null || warn "brew install --cask wezterm failed (continuing)."
+    else
+      warn "Homebrew not found. Skipping wezterm."
+    fi
+    return 0
+  fi
+
+  # Linux with sudo: try package manager first
+  if have_passwordless_sudo; then
+    if need_cmd apt-get; then
+      sudo -n apt-get install -y wezterm >/dev/null 2>&1 && { log "wezterm installed via apt."; return 0; } || true
+    elif need_cmd dnf; then
+      sudo -n dnf install -y wezterm >/dev/null 2>&1 && { log "wezterm installed via dnf."; return 0; } || true
+    fi
+  fi
+
+  # AppImage download (self-contained, no system deps needed)
+  log "Installing wezterm ${WEZTERM_VERSION} (AppImage)"
+  mkdir -p "${HOME}/.local/bin"
+  local url="https://github.com/wezterm/wezterm/releases/download/${WEZTERM_VERSION}/WezTerm-${WEZTERM_VERSION}-Ubuntu20.04.AppImage"
+  download_to "$url" "${HOME}/.local/bin/wezterm"
+  chmod +x "${HOME}/.local/bin/wezterm"
+  log "wezterm AppImage installed to ~/.local/bin/wezterm"
+}
+
 # ---------------------------------------------------------------------------
 # Cache symlink management
 # Local drive is small (128G). Move heavy caches to /local and symlink back.
@@ -877,6 +992,8 @@ run_check_mode() {
     "zsh-syntax-highlighting:${HOME}/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting"
     "oh-my-tmux:${HOME}/.config/tmux/tmux.conf"
     "nvm:${HOME}/.nvm/nvm.sh"
+    "yazi:yazi"
+    "wezterm:wezterm"
   )
 
   for entry in "${checks[@]}"; do
@@ -1055,6 +1172,8 @@ main() {
   install_oh_my_tmux
   install_tmux_local_config
   install_nvm_and_node
+  install_yazi
+  install_wezterm
   enable_bash_to_zsh_handoff
   fix_line_endings
 
@@ -1077,6 +1196,8 @@ main() {
   echo "     - node -v && npm -v"
   echo "     - zsh --version"
   echo "     - tmux -V (if installed)"
+  echo "     - yazi --version"
+  echo "     - wezterm --version"
   echo "  3) If you didn't provide a p10k config, run: p10k configure"
 }
 
