@@ -776,6 +776,22 @@ install_tmux_local_config() {
   fi
 
   chmod 0644 "$dest"
+
+  # Set tmux default shell to zsh (resolved at install time)
+  local zsh_path
+  zsh_path="$(command -v zsh 2>/dev/null || echo "/bin/zsh")"
+  local marker="TMUX_DEFAULT_SHELL"
+  local block
+  block="$(cat <<BLOCK
+# ---- TMUX_DEFAULT_SHELL ----
+# use zsh inside tmux (login shell may still be bash)
+set -g default-shell "$zsh_path"
+set -g default-command "$zsh_path"
+# ---- /TMUX_DEFAULT_SHELL ----
+BLOCK
+)"
+  append_block_if_missing "$dest" "$marker" "$block"
+
   # Removed destructive ln -sf that overwrote tmux.conf (P0-#2)
   # oh-my-tmux auto-sources tmux.conf.local; reload from correct path
   tmux source-file "${HOME}/.config/tmux/tmux.conf.local" 2>/dev/null || true
