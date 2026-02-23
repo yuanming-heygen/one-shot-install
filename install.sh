@@ -30,6 +30,7 @@ ZSH_AUTOSUGG_TAG="v0.7.1"
 ZSH_SYNTAX_HL_TAG="0.8.0"
 YAZI_VERSION="v26.1.22"
 WEZTERM_VERSION="20240203-110809-5046fc22"
+CHAFA_VERSION="1.18.1"
 
 # Flags (set by parse_args)
 CHECK_MODE=false
@@ -539,10 +540,29 @@ install_yazi() {
   if [[ ${#missing_opt[@]} -gt 0 ]]; then
     log "yazi optional deps missing: ${missing_opt[*]}"
     try_install_pkgs_no_password "${missing_opt[@]}"
-    for dep in "${missing_opt[@]}"; do
-      need_cmd "$dep" || warn "Optional: '$dep' not installed (yazi media preview may be limited)"
-    done
   fi
+
+  # chafa: fall back to static binary if package manager didn't work (x86_64 only)
+  if ! need_cmd chafa && [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+    log "Installing chafa ${CHAFA_VERSION} static binary"
+    local chafa_url="https://hpjansson.org/chafa/releases/static/chafa-${CHAFA_VERSION}-1-x86_64-linux-gnu.tar.gz"
+    local chafa_tmp
+    chafa_tmp="$(mktemp -d "${TMPDIR:-/tmp}/chafa-install.XXXXXX")"
+    if download_to "$chafa_url" "${chafa_tmp}/chafa.tar.gz"; then
+      tar -xzf "${chafa_tmp}/chafa.tar.gz" -C "$chafa_tmp"
+      mkdir -p "${HOME}/.local/bin"
+      cp "${chafa_tmp}/chafa-${CHAFA_VERSION}-1-x86_64-linux-gnu/chafa" "${HOME}/.local/bin/chafa"
+      chmod +x "${HOME}/.local/bin/chafa"
+      log "chafa ${CHAFA_VERSION} installed to ~/.local/bin/"
+    else
+      warn "Failed to download chafa static binary (continuing)"
+    fi
+    rm -rf "$chafa_tmp"
+  fi
+
+  for dep in "${yazi_opt_deps[@]}"; do
+    need_cmd "$dep" || warn "Optional: '$dep' not installed (yazi media preview may be limited)"
+  done
 
   # macOS: prefer brew
   if [[ "$(uname -s)" == "Darwin" ]]; then
